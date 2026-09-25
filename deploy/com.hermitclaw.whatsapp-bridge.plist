@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermitclaw.whatsapp-bridge</string>
+
+    <!-- The built binary, not `go run`: that compiles to a cache binary and
+         spawns it as a child, so launchd would supervise the wrapper rather
+         than the process actually holding the WhatsApp connection. Rebuild
+         with `go build -o bin/whatsapp-bridge .` after changing main.go. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ebiya.sg/dev/whatsapp-mcp/whatsapp-bridge/bin/whatsapp-bridge</string>
+    </array>
+
+    <!-- The bridge resolves store/ relative to the working directory. Getting
+         this wrong creates a second, empty archive somewhere else. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/ebiya.sg/dev/whatsapp-mcp/whatsapp-bridge</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash, but not on a deliberate clean exit. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Default is 10s. During a crash loop - an expired session waiting for a
+         QR scan, or a protocol break like "client outdated (405)" - that is six
+         restarts a minute indefinitely. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- The QR code for re-authentication prints here, roughly every 20 days. -->
+    <key>StandardOutPath</key>
+    <string>/Users/ebiya.sg/Library/Logs/whatsapp-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ebiya.sg/Library/Logs/whatsapp-bridge.log</string>
+</dict>
+</plist>

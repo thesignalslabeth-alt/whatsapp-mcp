@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermitclaw.whatsapp-health</string>
+
+    <!-- Supervision alone cannot tell "connected and quiet" from "stalled":
+         an expired session or a protocol break leaves a live process that
+         syncs nothing, and reads keep succeeding against the frozen archive.
+         This checks the data, not the process. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>healthcheck.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ebiya.sg/dev/whatsapp-mcp/whatsapp-mcp-server</string>
+
+    <!-- Every 30 minutes. WhatsApp Web reconnects constantly - 55 connects and
+         54 disconnects were logged across two days - so this alerts on
+         staleness rather than on disconnect events. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Deliberately no RunAtLoad. Both agents load together at login, so a
+         check at load time races the bridge's startup and reports a failure
+         that is not real. The first genuine check happens one interval in. -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/ebiya.sg/Library/Logs/whatsapp-health.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ebiya.sg/Library/Logs/whatsapp-health.log</string>
+</dict>
+</plist>

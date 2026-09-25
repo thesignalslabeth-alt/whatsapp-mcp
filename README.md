@@ -181,3 +181,42 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+---
+
+## Local fork notes (hermit-synthwork)
+
+Private fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp)
+(MIT, © 2025 Luke Harries) forked at `7d6a06d`. Upstream did not run as shipped;
+see commit `73453dd` for the fixes and hardening.
+
+**Read-only by default.** The send tools are unregistered. Reads are gated by an
+allowlist in `~/.config/whatsapp-mcp/allowlist.json`, enforced in `guard.py` via
+TEMP views shadowing `chats`/`messages`, so every query path filters by
+construction. Missing or malformed config allows nothing.
+
+Promotion is a CLI, never an MCP tool — untrusted message content must not be able
+to widen what the agent may read:
+
+```bash
+uv run python allowlist_cli.py search "<name>"
+uv run python allowlist_cli.py add <jid>
+```
+
+**Running under launchd.** Templates in `deploy/`, installed to
+`~/Library/LaunchAgents/`:
+
+- `com.hermitclaw.whatsapp-bridge` — supervises the bridge, restarts on crash
+- `com.hermitclaw.whatsapp-health` — checks every 30 min that data is actually
+  fresh, not merely that the process exists
+
+**Rebuild the binary after changing `main.go`**, or launchd keeps running the old
+one:
+
+```bash
+cd whatsapp-bridge && go build -o bin/whatsapp-bridge .
+launchctl kickstart -k gui/$(id -u)/com.hermitclaw.whatsapp-bridge
+```
+
+Logs: `~/Library/Logs/whatsapp-bridge.log` (the re-auth QR prints here, roughly
+every 20 days) and `~/Library/Logs/whatsapp-health.log`.
