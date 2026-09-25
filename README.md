@@ -193,7 +193,8 @@ see commit `73453dd` for the fixes and hardening.
 **Read-only by default.** The send tools are unregistered. Reads are gated by an
 allowlist in `~/.config/whatsapp-mcp/allowlist.json`, enforced in `guard.py` via
 TEMP views shadowing `chats`/`messages`, so every query path filters by
-construction. Missing or malformed config allows nothing.
+construction. Missing or malformed config allows nothing. To turn sending on
+for a task, see [SENDING.md](SENDING.md).
 
 Promotion is a CLI, never an MCP tool — untrusted message content must not be able
 to widen what the agent may read:
