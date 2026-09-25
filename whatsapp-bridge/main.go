@@ -84,6 +84,27 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Trust-relevant events about other users. Deliberately metadata only:
+		-- who and when, never message content.
+		CREATE TABLE IF NOT EXISTS security_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_type TEXT NOT NULL,
+			jid TEXT,
+			timestamp TIMESTAMP NOT NULL,
+			detail TEXT,
+			acknowledged BOOLEAN NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_security_events_jid ON security_events(jid);
+
+		-- Connection lifecycle, so staleness can be detected from real events
+		-- rather than inferred from how old the newest message is.
+		CREATE TABLE IF NOT EXISTS connection_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_type TEXT NOT NULL,
+			timestamp TIMESTAMP NOT NULL,
+			detail TEXT
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -91,6 +112,23 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	return &MessageStore{db: db}, nil
+}
+
+// StoreSecurityEvent records a trust-relevant event about another user.
+// Callers must pass metadata only - never message content.
+func (store *MessageStore) StoreSecurityEvent(eventType, jid string, ts time.Time, detail string) error {
+	_, err := store.db.Exec(
+		"INSERT INTO security_events (event_type, jid, timestamp, detail) VALUES (?, ?, ?, ?)",
+		eventType, jid, ts, detail)
+	return err
+}
+
+// StoreConnectionEvent records a connection lifecycle transition.
+func (store *MessageStore) StoreConnectionEvent(eventType string, detail string) error {
+	_, err := store.db.Exec(
+		"INSERT INTO connection_events (event_type, timestamp, detail) VALUES (?, ?, ?)",
+		eventType, time.Now(), detail)
+	return err
 }
 
 // Close the database connection
@@ -641,7 +679,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -775,13 +813,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			// Usually means another bridge already holds the port. Continuing
+			// would leave a second WhatsApp client connected to the same
+			// session store with no working API - worse than not starting.
+			fmt.Printf("FATAL: REST API server could not start: %v\n", err)
+			fmt.Printf("Another bridge is probably already running. Exiting.\n")
+			os.Exit(1)
 		}
 	}()
 }
@@ -800,14 +843,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,9 +890,67 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			messageStore.StoreConnectionEvent("connected", "")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			messageStore.StoreConnectionEvent("logged_out", v.Reason.String())
+
+		// --- Trust-relevant events -------------------------------------
+		// A contact's identity key rotating means a new primary device:
+		// a reinstall, a new phone, or an account takeover. This is the
+		// "security code changed" notice, and it is the only cheap signal
+		// that an allowlisted JID may have changed hands.
+		case *events.IdentityChange:
+			detail := "server notification"
+			if v.Implicit {
+				detail = "inferred from untrusted identity error"
+			}
+			logger.Warnf("Identity change for %s (%s)", v.JID, detail)
+			messageStore.StoreSecurityEvent("identity_change", v.JID.String(), v.Timestamp, detail)
+
+		// Membership changes dilute the trust granted to an allowlisted
+		// group, so record who joined or left.
+		case *events.GroupInfo:
+			if len(v.Join) > 0 || len(v.Leave) > 0 {
+				detail := fmt.Sprintf("joined=%d left=%d", len(v.Join), len(v.Leave))
+				logger.Infof("Group membership change in %s: %s", v.JID, detail)
+				messageStore.StoreSecurityEvent("group_membership", v.JID.String(), v.Timestamp, detail)
+			}
+
+		case *events.JoinedGroup:
+			logger.Infof("Added to group %s (%s)", v.JID, v.Reason)
+			messageStore.StoreSecurityEvent("joined_group", v.JID.String(), time.Now(),
+				fmt.Sprintf("reason=%s type=%s", v.Reason, v.Type))
+
+		// --- Connection health ------------------------------------------
+		// These make staleness observable as events rather than something
+		// inferred from the age of the newest message.
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			messageStore.StoreConnectionEvent("disconnected", "")
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("Keepalive timeout (%d errors)", v.ErrorCount)
+			messageStore.StoreConnectionEvent("keepalive_timeout",
+				fmt.Sprintf("errors=%d last_success=%s", v.ErrorCount, v.LastSuccess.Format(time.RFC3339)))
+
+		case *events.KeepAliveRestored:
+			logger.Infof("Keepalive restored")
+			messageStore.StoreConnectionEvent("keepalive_restored", "")
+
+		case *events.ClientOutdated:
+			logger.Errorf("Client outdated - whatsmeow needs updating")
+			messageStore.StoreConnectionEvent("client_outdated", "update whatsmeow dependency")
+
+		case *events.TemporaryBan:
+			logger.Errorf("Temporary ban: %s (expires in %s)", v.Code, v.Expire)
+			messageStore.StoreConnectionEvent("temporary_ban",
+				fmt.Sprintf("code=%d expires_in=%s", v.Code, v.Expire))
+
+		case *events.StreamReplaced:
+			logger.Warnf("Stream replaced - another client connected")
+			messageStore.StoreConnectionEvent("stream_replaced", "")
 		}
 	})
 
@@ -973,7 +1074,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1089,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

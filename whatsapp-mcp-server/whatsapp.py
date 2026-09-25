@@ -1,7 +1,8 @@
 import sqlite3
+import guard
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import os.path
 import requests
 import json
@@ -49,7 +50,7 @@ class MessageContext:
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         # First try matching by exact JID
@@ -135,7 +136,7 @@ def list_messages(
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         # Build base query
@@ -230,7 +231,7 @@ def get_message_context(
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         # Get the target message first
@@ -325,18 +326,29 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
+        # Build base query. The last-message columns are only valid when the
+        # messages table is actually joined below; otherwise select NULLs so the
+        # column positions stay stable for the row unpacking further down.
+        if include_last_message:
+            last_message_cols = """
+                messages.content as last_message,
+                messages.sender as last_sender,
+                messages.is_from_me as last_is_from_me"""
+        else:
+            last_message_cols = """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me"""
+
+        query_parts = [f"""
             SELECT 
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_message_cols}
             FROM chats
         """]
         
@@ -393,7 +405,7 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
@@ -441,7 +453,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -486,7 +498,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -535,7 +547,7 @@ def get_last_interaction(jid: str) -> str:
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         query = """
@@ -583,7 +595,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = guard.connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -765,3 +777,185 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# --- Quarantine views -------------------------------------------------------
+# These read the full archive on purpose, so they return metadata only: who,
+# when, how many. Message content is never selected here. Learning that an
+# unknown number messaged you is safe; reading what it wrote is the risk the
+# allowlist exists to manage.
+
+def _chat_kind(jid: str) -> str:
+    if jid.endswith("@g.us"):
+        return "group"
+    if jid.endswith("@lid"):
+        return "lid"
+    return "direct"
+
+
+def list_quarantined(limit: int = 30, days: Optional[int] = None) -> List[Dict[str, Any]]:
+    """List chats excluded by the allowlist, as metadata only (never content)."""
+    allowed = set(guard.allowed_jids())
+    conn = guard.connect_unfiltered()
+    try:
+        sql = """
+            SELECT c.jid, c.name, COUNT(m.id), MAX(m.timestamp)
+            FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid
+        """
+        params: List[Any] = []
+        if days is not None:
+            sql += " WHERE m.timestamp >= datetime('now', ?)"
+            params.append(f"-{int(days)} days")
+        sql += " GROUP BY c.jid ORDER BY MAX(m.timestamp) DESC"
+
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        out = []
+        for jid, name, count, last in rows:
+            if jid in allowed:
+                continue
+            out.append({
+                "jid": jid,
+                "name": name or "(no name)",
+                "kind": _chat_kind(jid),
+                "message_count": count,
+                "last_message_time": last,
+            })
+            if len(out) >= limit:
+                break
+        return out
+    finally:
+        conn.close()
+
+
+def find_chat(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Search all chats by name or JID, metadata only, to identify what to allow."""
+    allowed = set(guard.allowed_jids())
+    conn = guard.connect_unfiltered()
+    try:
+        pattern = f"%{query}%"
+        rows = conn.execute("""
+            SELECT c.jid, c.name, COUNT(m.id), MAX(m.timestamp)
+            FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid
+            WHERE LOWER(c.name) LIKE LOWER(?) OR LOWER(c.jid) LIKE LOWER(?)
+            GROUP BY c.jid ORDER BY COUNT(m.id) DESC LIMIT ?
+        """, (pattern, pattern, limit)).fetchall()
+        return [{
+            "jid": jid,
+            "name": name or "(no name)",
+            "kind": _chat_kind(jid),
+            "message_count": count,
+            "last_message_time": last,
+            "allowed": jid in allowed,
+        } for jid, name, count, last in rows]
+    finally:
+        conn.close()
+
+
+def allowlist_status() -> Dict[str, Any]:
+    """Report the active filter, so a stale or empty config is visible."""
+    cfg = guard.load_config()
+    allowed = cfg["read_allowlist"]
+    conn = guard.connect_unfiltered()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+    finally:
+        conn.close()
+    return {
+        "config_path": guard.CONFIG_PATH,
+        "status": cfg["_status"],
+        "allowed_chats": len(allowed),
+        "quarantined_chats": total - len(allowed),
+        "send_enabled": cfg["send_enabled"],
+        "allowed_jids": allowed,
+    }
+
+
+# --- Trust and health -------------------------------------------------------
+
+def security_events(limit: int = 30, allowlisted_only: bool = False) -> List[Dict[str, Any]]:
+    """Identity changes and group membership changes recorded by the bridge.
+
+    An identity change means the contact's primary device changed - a reinstall,
+    a new phone, or an account takeover. For a JID on the read allowlist that is
+    a prompt to re-confirm who you are actually talking to, since the allowlist
+    pins a JID and cannot pin the person behind it.
+    """
+    allowed = set(guard.allowed_jids())
+    conn = guard.connect_unfiltered()
+    try:
+        try:
+            rows = conn.execute("""
+                SELECT e.event_type, e.jid, e.timestamp, e.detail, c.name
+                FROM security_events e LEFT JOIN chats c ON c.jid = e.jid
+                ORDER BY e.timestamp DESC LIMIT ?
+            """, (limit,)).fetchall()
+        except sqlite3.OperationalError:
+            return [{"error": "security_events table missing - restart the bridge to create it"}]
+
+        out = []
+        for etype, jid, ts, detail, name in rows:
+            is_allowed = jid in allowed
+            if allowlisted_only and not is_allowed:
+                continue
+            out.append({
+                "event": etype,
+                "jid": jid,
+                "name": name or "(unknown)",
+                "timestamp": ts,
+                "detail": detail,
+                "on_allowlist": is_allowed,
+                "action": "re-confirm identity before trusting this chat" if (
+                    is_allowed and etype == "identity_change") else None,
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def bridge_health() -> Dict[str, Any]:
+    """Whether the bridge is actually working, not merely running.
+
+    Reads still succeed against a stale archive when the bridge is down, so
+    "no new messages" and "not connected" look identical from the query side.
+    This distinguishes them.
+    """
+    import socket
+    from datetime import datetime, timezone
+
+    conn = guard.connect_unfiltered()
+    try:
+        last_msg = conn.execute("SELECT MAX(timestamp) FROM messages").fetchone()[0]
+        try:
+            row = conn.execute(
+                "SELECT event_type, timestamp, detail FROM connection_events "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.OperationalError:
+            row = None
+    finally:
+        conn.close()
+
+    sock = socket.socket()
+    sock.settimeout(1.0)
+    reachable = sock.connect_ex(("127.0.0.1", 8080)) == 0
+    sock.close()
+
+    age_minutes = None
+    if last_msg:
+        try:
+            age_minutes = round(
+                (datetime.now(timezone.utc) - datetime.fromisoformat(last_msg)).total_seconds() / 60, 1)
+        except ValueError:
+            pass
+
+    healthy = reachable and (age_minutes is not None and age_minutes < 60)
+    return {
+        "bridge_api_reachable": reachable,
+        "last_connection_event": {"type": row[0], "at": row[1], "detail": row[2]} if row else None,
+        "newest_message": last_msg,
+        "newest_message_age_minutes": age_minutes,
+        "healthy": healthy,
+        "warning": None if healthy else (
+            "bridge API not reachable - reads will return stale data silently"
+            if not reachable else
+            "no messages recently; bridge may be connected but not syncing"),
+    }

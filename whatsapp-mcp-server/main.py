@@ -12,7 +12,12 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_quarantined as whatsapp_list_quarantined,
+    find_chat as whatsapp_find_chat,
+    allowlist_status as whatsapp_allowlist_status,
+    security_events as whatsapp_security_events,
+    bridge_health as whatsapp_bridge_health
 )
 
 # Initialize FastMCP server
@@ -154,7 +159,7 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+# @mcp.tool()  # DISABLED: read-only mode (see guard.py / allowlist.json)
 def send_message(
     recipient: str,
     message: str
@@ -183,7 +188,7 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
+# @mcp.tool()  # DISABLED: read-only mode (see guard.py / allowlist.json)
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -203,7 +208,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
+# @mcp.tool()  # DISABLED: read-only mode (see guard.py / allowlist.json)
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     
@@ -245,6 +250,55 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+
+@mcp.tool()
+def list_quarantined(limit: int = 30, days: Optional[int] = None) -> List[Dict[str, Any]]:
+    """List chats blocked by the allowlist. Returns metadata only - sender, count,
+    last seen - never message content.
+
+    Args:
+        limit: Maximum chats to return (default 30)
+        days: Optionally restrict to chats active in the last N days
+    """
+    return whatsapp_list_quarantined(limit, days)
+
+@mcp.tool()
+def find_chat(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Search every chat by name or JID to find what to allow. Metadata only,
+    no message content. Use this to identify JIDs worth adding to the allowlist.
+
+    Args:
+        query: Text to match against chat name or JID
+        limit: Maximum results (default 20)
+    """
+    return whatsapp_find_chat(query, limit)
+
+@mcp.tool()
+def allowlist_status() -> Dict[str, Any]:
+    """Show the active read filter: how many chats are visible vs quarantined,
+    and whether sending is enabled. Check this when results look unexpectedly empty."""
+    return whatsapp_allowlist_status()
+
+
+@mcp.tool()
+def security_events(limit: int = 30, allowlisted_only: bool = False) -> List[Dict[str, Any]]:
+    """Identity changes and group membership changes. An identity change means a
+    contact's primary device changed - reinstall, new phone, or account takeover.
+    For an allowlisted JID, treat it as a prompt to re-confirm who you are talking to.
+
+    Args:
+        limit: Maximum events to return (default 30)
+        allowlisted_only: Only report events for chats on the read allowlist
+    """
+    return whatsapp_security_events(limit, allowlisted_only)
+
+@mcp.tool()
+def bridge_health() -> Dict[str, Any]:
+    """Check whether the WhatsApp bridge is actually working. Reads succeed against
+    a stale archive when the bridge is down, so call this before answering anything
+    time-sensitive - otherwise 'no new messages' and 'not connected' look identical."""
+    return whatsapp_bridge_health()
 
 if __name__ == "__main__":
     # Initialize and run the server
