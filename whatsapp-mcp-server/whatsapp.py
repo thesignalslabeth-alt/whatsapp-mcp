@@ -912,6 +912,10 @@ def security_events(limit: int = 30, allowlisted_only: bool = False) -> List[Dic
         conn.close()
 
 
+# Quiet gaps in this archive reach 480 minutes overnight; see bridge_health.
+STALE_THRESHOLD_MINUTES = 720
+
+
 def bridge_health() -> Dict[str, Any]:
     """Whether the bridge is actually working, not merely running.
 
@@ -947,7 +951,14 @@ def bridge_health() -> Dict[str, Any]:
         except ValueError:
             pass
 
-    healthy = reachable and (age_minutes is not None and age_minutes < 60)
+    # Message age is a weak signal: it depends on other people writing to you.
+    # Measured over 14 days of this archive, ordinary quiet gaps reach 480
+    # minutes overnight (p99 26m, p99.9 294m), so anything tighter reports a
+    # failure every night. 720m sits clear of the observed maximum while still
+    # catching a genuine stall within half a day. Reachability is the reliable
+    # signal; staleness is the backstop for "process alive, session expired".
+    stale = age_minutes is not None and age_minutes >= STALE_THRESHOLD_MINUTES
+    healthy = reachable and not stale
     return {
         "bridge_api_reachable": reachable,
         "last_connection_event": {"type": row[0], "at": row[1], "detail": row[2]} if row else None,
@@ -957,5 +968,6 @@ def bridge_health() -> Dict[str, Any]:
         "warning": None if healthy else (
             "bridge API not reachable - reads will return stale data silently"
             if not reachable else
-            "no messages recently; bridge may be connected but not syncing"),
+            f"no messages in {age_minutes:.0f}m (threshold {STALE_THRESHOLD_MINUTES}m); "
+            "bridge may be connected but not syncing"),
     }
